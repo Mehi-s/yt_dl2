@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 YouTube Downloader - Processes commands from commands.txt
-Uses pytube for downloading and youtube-search-python for searching
+Uses pytube with multiple fallback methods for reliability
 Video Quality: At least 360p, but lowest possible above that
 """
 
@@ -9,19 +9,57 @@ import os
 import sys
 import json
 import time
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import re
+import urllib.request
+import urllib.error
 
+# Install required packages if missing
+def install_requirements():
+    packages = [
+        'pytube>=15.0.0',
+        'yt-dlp>=2023.12.30',  # Better alternative with frequent updates
+        'youtube-search-python>=1.6.6',
+    ]
+    
+    for package in packages:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", package])
+        except Exception as e:
+            print(f"⚠️ Failed to install {package}: {e}")
+
+# Try installing dependencies
+try:
+    install_requirements()
+except:
+    pass
+
+# Try multiple import methods
+YT_DLP_AVAILABLE = False
+PYTUBE_AVAILABLE = False
+
+# Try yt-dlp first (more reliable)
+try:
+    import yt_dlp
+    YT_DLP_AVAILABLE = True
+    print("✅ Using yt-dlp as primary downloader")
+except ImportError:
+    print("⚠️ yt-dlp not available, trying pytube...")
+
+# Try pytube as fallback
 try:
     from pytube import YouTube, Search, Channel
     from pytube.exceptions import VideoUnavailable, PytubeError
+    PYTUBE_AVAILABLE = True
+    if not YT_DLP_AVAILABLE:
+        print("✅ Using pytube as downloader")
 except ImportError:
-    print("Installing required packages...")
-    os.system("pip install pytube pytube-search youtube-search-python")
-    from pytube import YouTube, Search, Channel
-    from pytube.exceptions import VideoUnavailable, PytubeError
+    if not YT_DLP_AVAILABLE:
+        print("❌ Neither yt-dlp nor pytube available")
+        sys.exit(1)
 
 class YouTubeDownloader:
     def __init__(self):
@@ -33,18 +71,15 @@ class YouTubeDownloader:
         self.downloads_dir.mkdir(exist_ok=True)
         self.results_dir.mkdir(exist_ok=True)
         
-        # Maximum file size for GitHub (100MB limit, we'll use 90MB to be safe)
-        self.max_file_size = 90 * 1024 * 1024  # 90MB
+        # Maximum file size for GitHub (90MB)
+        self.max_file_size = 90 * 1024 * 1024
         
-        # Quality settings - at least 360p but lowest possible
-        self.min_quality = 360  # Minimum 360p
-        self.quality_preference = ['360p', '480p', '720p']  # Order of preference (lowest first)
+        # Quality settings
+        self.min_quality = 360
         
     def sanitize_filename(self, filename: str) -> str:
         """Remove invalid characters from filename"""
-        # Remove invalid characters
         filename = re.sub(r'[<>:"/\\|?*]', '', filename)
-        # Limit length
         if len(filename) > 200:
             filename = filename[:200]
         return filename
@@ -69,167 +104,298 @@ class YouTubeDownloader:
             f.write("#   channel <url> - Get 10 recent videos from channel\n")
             f.write("# Add your commands below this line:\n\n")
     
-    def parse_resolution(self, resolution_str: str) -> int:
-        """Parse resolution string to integer (e.g., '720p' -> 720)"""
-        if not resolution_str:
-            return 0
+    def download_with_ytdlp(self, url: str) -> bool:
+        """Download using yt-dlp (most reliable method)"""
+        print("📥 Using yt-dlp for download...")
+        
         try:
-            return int(resolution_str.replace('p', ''))
-        except ValueError:
-            return 0
-    
-    def select_best_stream(self, yt: YouTube) -> Tuple[Optional[object], str]:
-        """
-        Select the best stream based on quality preferences:
-        - At least 360p
-        - Lowest possible quality above 360p
-        - Under 90MB file size limit
-        Returns (stream, quality_description)
-        """
-        print("  🎯 Selecting optimal video quality...")
-        
-        # Get all progressive streams (video + audio) sorted by resolution
-        progressive_streams = yt.streams.filter(
-            progressive=True, 
-            file_extension='mp4'
-        ).order_by('resolution')
-        
-        # Get adaptive streams as backup
-        adaptive_streams = yt.streams.filter(
-            adaptive=True, 
-            file_extension='mp4',
-            only_video=True
-        ).order_by('resolution')
-        
-        # Process progressive streams
-        available_qualities = []
-        for stream in progressive_streams:
-            res = self.parse_resolution(stream.resolution)
-            if res >= self.min_quality:  # At least 360p
-                size_mb = stream.filesize / (1024*1024) if stream.filesize else float('inf')
-                available_qualities.append({
-                    'stream': stream,
-                    'resolution': res,
-                    'size_mb': size_mb,
-                    'type': 'progressive',
-                    'fps': stream.fps if hasattr(stream, 'fps') else 30
-                })
-                print(f"    📊 Found: {stream.resolution} ({size_mb:.1f} MB) - Progressive")
-        
-        if not available_qualities:
-            print("  ⚠️ No progressive streams meet quality requirements")
-            print("  🔄 Trying adaptive streams with separate audio...")
+            # First, extract video info without downloading
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': False,
+            }
             
-            # Check adaptive streams
-            for stream in adaptive_streams:
-                res = self.parse_resolution(stream.resolution)
-                if res >= self.min_quality:
-                    size_mb = stream.filesize / (1024*1024) if stream.filesize else float('inf')
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                
+                title = info.get('title', 'Unknown')
+                duration = info.get('duration', 0)
+                view_count = info.get('view_count', 0)
+                uploader = info.get('uploader', 'Unknown')
+                
+                print(f"  📹 Title: {title}")
+                print(f"  ⏱️ Duration: {duration} seconds")
+                print(f"  👁️ Views: {view_count:,}")
+                print(f"  👤 Channel: {uploader}")
+                
+                # Find best format meeting our criteria
+                formats = info.get('formats', [])
+                
+                # Filter formats: progressive (video+audio), mp4, >=360p
+                suitable_formats = []
+                for fmt in formats:
+                    height = fmt.get('height')
+                    if height and height >= self.min_quality:
+                        filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
+                        if filesize and filesize > 0:
+                            suitable_formats.append({
+                                'format_id': fmt['format_id'],
+                                'height': height,
+                                'filesize': filesize,
+                                'ext': fmt.get('ext', 'mp4'),
+                                'vcodec': fmt.get('vcodec', 'none'),
+                                'acodec': fmt.get('acodec', 'none'),
+                            })
+                
+                if not suitable_formats:
+                    print("  ❌ No suitable formats found")
+                    return False
+                
+                # Sort by height (ascending) to get lowest quality >=360p
+                suitable_formats.sort(key=lambda x: x['height'])
+                
+                # Find the first format under size limit
+                selected_format = None
+                for fmt in suitable_formats:
+                    size_mb = fmt['filesize'] / (1024*1024)
+                    if size_mb <= (self.max_file_size / (1024*1024)):
+                        selected_format = fmt
+                        print(f"  ✅ Selected: {fmt['height']}p ({size_mb:.1f} MB)")
+                        break
+                
+                if not selected_format:
+                    # Select smallest format that meets quality requirements
+                    selected_format = min(suitable_formats, key=lambda x: x['filesize'])
+                    size_mb = selected_format['filesize'] / (1024*1024)
+                    print(f"  ⚠️ All over size limit, selecting smallest: {selected_format['height']}p ({size_mb:.1f} MB)")
+                
+                # Download the video
+                safe_title = self.sanitize_filename(title)
+                output_template = str(self.downloads_dir / f"{safe_title}.%(ext)s")
+                
+                download_opts = {
+                    'format': selected_format['format_id'],
+                    'outtmpl': output_template,
+                    'quiet': False,
+                    'no_warnings': False,
+                    'progress_hooks': [self._progress_hook],
+                }
+                
+                print(f"  📥 Downloading in {selected_format['height']}p...")
+                
+                with yt_dlp.YoutubeDL(download_opts) as ydl:
+                    ydl.download([url])
+                
+                # Find the downloaded file
+                downloaded_files = list(self.downloads_dir.glob(f"{safe_title}.*"))
+                if downloaded_files:
+                    video_path = downloaded_files[0]
                     
-                    # Estimate audio size (typically 3-5MB for audio)
-                    estimated_total = size_mb + 5  # Add 5MB for audio
+                    # Save video info
+                    info_file = self.downloads_dir / f"{safe_title}_info.txt"
+                    with open(info_file, 'w', encoding='utf-8') as f:
+                        f.write(f"Title: {title}\n")
+                        f.write(f"URL: {url}\n")
+                        f.write(f"Duration: {duration} seconds\n")
+                        f.write(f"Views: {view_count:,}\n")
+                        f.write(f"Author: {uploader}\n")
+                        f.write(f"Quality: {selected_format['height']}p\n")
+                        f.write(f"File Size: {os.path.getsize(video_path) / (1024*1024):.1f} MB\n")
+                        f.write(f"Download Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        f.write(f"Downloader: yt-dlp\n")
+                        f.write(f"Quality Policy: Minimum 360p, lowest possible\n")
                     
-                    available_qualities.append({
-                        'stream': stream,
-                        'resolution': res,
-                        'size_mb': estimated_total,
-                        'type': 'adaptive',
-                        'fps': stream.fps if hasattr(stream, 'fps') else 30
-                    })
-                    print(f"    📊 Found: {stream.resolution} ({size_mb:.1f} MB + audio) - Adaptive")
+                    print(f"✅ Download complete: {video_path.name}")
+                    return True
+                
+        except Exception as e:
+            print(f"❌ yt-dlp download failed: {e}")
+            return False
         
-        if not available_qualities:
-            print("  ❌ No suitable streams found")
-            return None, "No suitable quality available"
+        return False
+    
+    def _progress_hook(self, d):
+        """Progress hook for yt-dlp"""
+        if d['status'] == 'downloading':
+            percent = d.get('_percent_str', 'N/A')
+            speed = d.get('_speed_str', 'N/A')
+            eta = d.get('_eta_str', 'N/A')
+            print(f"  ⏳ {percent} at {speed} - ETA: {eta}", end='\r')
+        elif d['status'] == 'finished':
+            print(f"\n  🔄 Processing video...")
+    
+    def download_with_pytube(self, url: str) -> bool:
+        """Download using pytube with error handling"""
+        print("📥 Trying pytube download...")
         
-        # Sort by resolution (ascending - lowest first)
-        available_qualities.sort(key=lambda x: x['resolution'])
+        try:
+            # Try to bypass age restriction and other blocks
+            yt = YouTube(
+                url,
+                use_oauth=False,
+                allow_oauth_cache=False
+            )
+            
+            # Try to get video info
+            try:
+                title = yt.title
+                duration = yt.length
+                views = yt.views
+                author = yt.author
+            except Exception as e:
+                print(f"  ⚠️ Could not get video info: {e}")
+                # Try with stream filter directly
+                try:
+                    streams = yt.streams.filter(progressive=True, file_extension='mp4')
+                    if not streams:
+                        raise Exception("No streams available")
+                    # Use first available stream
+                    stream = streams.order_by('resolution').first()
+                    if stream:
+                        title = "Unknown"
+                        safe_title = self.sanitize_filename(f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                        video_path = stream.download(
+                            output_path=str(self.downloads_dir),
+                            filename=f"{safe_title}.mp4"
+                        )
+                        print(f"✅ Downloaded: {safe_title}.mp4")
+                        return True
+                except:
+                    raise e
+            
+            print(f"  📹 Title: {title}")
+            print(f"  ⏱️ Duration: {duration} seconds")
+            print(f"  👁️ Views: {views:,}")
+            print(f"  👤 Author: {author}")
+            
+            # Get progressive streams with video+audio
+            streams = yt.streams.filter(
+                progressive=True,
+                file_extension='mp4'
+            ).order_by('resolution')
+            
+            if not streams:
+                print("  ❌ No progressive streams available")
+                return False
+            
+            # Find suitable streams (>=360p)
+            suitable_streams = []
+            for stream in streams:
+                try:
+                    height = int(stream.resolution.replace('p', ''))
+                    if height >= self.min_quality:
+                        filesize = stream.filesize
+                        if filesize:
+                            suitable_streams.append({
+                                'stream': stream,
+                                'height': height,
+                                'filesize': filesize,
+                            })
+                except:
+                    continue
+            
+            if not suitable_streams:
+                print("  ❌ No streams meeting quality requirements")
+                return False
+            
+            # Sort by height (ascending)
+            suitable_streams.sort(key=lambda x: x['height'])
+            
+            # Select best stream
+            selected = None
+            for s in suitable_streams:
+                size_mb = s['filesize'] / (1024*1024)
+                if size_mb <= (self.max_file_size / (1024*1024)):
+                    selected = s
+                    print(f"  ✅ Selected: {s['height']}p ({size_mb:.1f} MB)")
+                    break
+            
+            if not selected:
+                selected = min(suitable_streams, key=lambda x: x['filesize'])
+                size_mb = selected['filesize'] / (1024*1024)
+                print(f"  ⚠️ All over size, selecting smallest: {selected['height']}p ({size_mb:.1f} MB)")
+            
+            # Download
+            safe_title = self.sanitize_filename(title)
+            print(f"  📥 Downloading in {selected['height']}p...")
+            
+            video_path = selected['stream'].download(
+                output_path=str(self.downloads_dir),
+                filename=f"{safe_title}.mp4"
+            )
+            
+            # Save info
+            info_file = self.downloads_dir / f"{safe_title}_info.txt"
+            with open(info_file, 'w', encoding='utf-8') as f:
+                f.write(f"Title: {title}\n")
+                f.write(f"URL: {url}\n")
+                f.write(f"Duration: {duration} seconds\n")
+                f.write(f"Views: {views:,}\n")
+                f.write(f"Author: {author}\n")
+                f.write(f"Quality: {selected['height']}p\n")
+                f.write(f"File Size: {os.path.getsize(video_path) / (1024*1024):.1f} MB\n")
+                f.write(f"Download Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Downloader: pytube\n")
+                f.write(f"Quality Policy: Minimum 360p, lowest possible\n")
+            
+            print(f"✅ Download complete: {safe_title}.mp4")
+            return True
+            
+        except Exception as e:
+            print(f"❌ pytube download failed: {e}")
+            return False
+    
+    def download_video(self, url: str) -> bool:
+        """Main download method with fallbacks"""
+        print(f"⬇️ Downloading video: {url}")
+        print(f"🎯 Quality setting: At least 360p, lowest possible")
         
-        # Select strategy: Find the lowest quality that's at least 360p AND under size limit
-        selected = None
-        selection_reason = ""
+        # Validate URL
+        if not ('youtube.com' in url or 'youtu.be' in url):
+            print("❌ Invalid YouTube URL")
+            return False
         
-        for quality in available_qualities:
-            if quality['size_mb'] <= (self.max_file_size / (1024*1024)):
-                # Found a stream that meets both quality and size requirements
-                selected = quality
-                selection_reason = f"Selected {quality['stream'].resolution} - " \
-                                 f"lowest quality ≥360p under size limit ({quality['size_mb']:.1f} MB)"
-                break
+        # Try yt-dlp first (more reliable)
+        if YT_DLP_AVAILABLE:
+            success = self.download_with_ytdlp(url)
+            if success:
+                return True
+            print("🔄 yt-dlp failed, trying pytube...")
         
-        if not selected:
-            print("  ⚠️ All streams exceed size limit, selecting smallest available...")
-            # Select the smallest stream that meets quality requirements
-            available_qualities.sort(key=lambda x: x['size_mb'])
-            selected = available_qualities[0]
-            selection_reason = f"Selected {selected['stream'].resolution} - " \
-                             f"smallest ≥360p stream ({selected['size_mb']:.1f} MB)"
+        # Fallback to pytube
+        if PYTUBE_AVAILABLE:
+            success = self.download_with_pytube(url)
+            if success:
+                return True
         
-        print(f"  ✅ {selection_reason}")
-        
-        return selected['stream'], selected['stream'].resolution
+        # Last resort: try with direct URL
+        print("🔄 Trying direct download method...")
+        try:
+            # Use yt-dlp with simplest options
+            import yt_dlp
+            ydl_opts = {
+                'format': 'best[height>=360][filesize<90M]',
+                'outtmpl': str(self.downloads_dir / '%(title)s.%(ext)s'),
+                'quiet': False,
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                print(f"✅ Downloaded successfully")
+                return True
+                
+        except Exception as e:
+            print(f"❌ All download methods failed: {e}")
+            return False
     
     def search_youtube(self, query: str, max_results: int = 10):
         """Search YouTube and save results"""
         print(f"🔍 Searching YouTube for: {query}")
         
         try:
-            # Using pytube's Search functionality
-            search_results = Search(query)
-            
-            results = []
-            count = 0
-            
-            for video in search_results.results:
-                if count >= max_results:
-                    break
-                    
-                try:
-                    video_info = {
-                        'title': video.title,
-                        'url': f"https://youtube.com/watch?v={video.video_id}",
-                        'duration': str(video.length) if hasattr(video, 'length') else 'Unknown',
-                        'views': video.views if hasattr(video, 'views') else 'Unknown',
-                        'author': video.author if hasattr(video, 'author') else 'Unknown'
-                    }
-                    results.append(video_info)
-                    count += 1
-                    print(f"  ✅ {count}. {video_info['title'][:80]}")
-                except Exception as e:
-                    print(f"  ⚠️ Error getting video info: {e}")
-                    continue
-            
-            # Save results to file
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            results_file = self.results_dir / f"search_{self.sanitize_filename(query)}_{timestamp}.txt"
-            
-            with open(results_file, 'w', encoding='utf-8') as f:
-                f.write(f"YouTube Search Results for: {query}\n")
-                f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("=" * 60 + "\n\n")
-                
-                for i, video in enumerate(results, 1):
-                    f.write(f"{i}. {video['title']}\n")
-                    f.write(f"   URL: {video['url']}\n")
-                    f.write(f"   Channel: {video['author']}\n")
-                    f.write(f"   Duration: {video['duration']} seconds\n")
-                    f.write(f"   Views: {video['views']}\n")
-                    f.write("\n")
-            
-            # Also save as JSON for easier parsing
-            json_file = self.results_dir / f"search_{self.sanitize_filename(query)}_{timestamp}.json"
-            with open(json_file, 'w', encoding='utf-8') as f:
-                json.dump(results, f, indent=2, ensure_ascii=False)
-            
-            print(f"📄 Results saved to: {results_file}")
-            print(f"📄 JSON saved to: {json_file}")
-            return results
-            
-        except Exception as e:
-            print(f"❌ Search failed: {e}")
-            # Fallback: try with alternative method
+            # Try using youtube-search-python (most reliable)
             try:
-                print("🔄 Trying alternative search method...")
                 from youtubesearchpython import VideosSearch
                 videos_search = VideosSearch(query, limit=max_results)
                 results_data = videos_search.result()
@@ -244,173 +410,129 @@ class YouTubeDownloader:
                         'author': video.get('channel', {}).get('name', 'Unknown')
                     }
                     results.append(video_info)
+                    print(f"  ✅ {len(results)}. {video_info['title'][:80]}")
                 
-                # Save results
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                results_file = self.results_dir / f"search_{self.sanitize_filename(query)}_{timestamp}.txt"
-                
-                with open(results_file, 'w', encoding='utf-8') as f:
-                    f.write(f"YouTube Search Results for: {query}\n")
-                    f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                    f.write("=" * 60 + "\n\n")
-                    
-                    for i, video in enumerate(results, 1):
-                        f.write(f"{i}. {video['title']}\n")
-                        f.write(f"   URL: {video['url']}\n")
-                        f.write(f"   Channel: {video['author']}\n")
-                        f.write(f"   Duration: {video['duration']}\n")
-                        f.write(f"   Views: {video['views']}\n")
-                        f.write("\n")
-                
-                print(f"📄 Results saved to: {results_file}")
-                return results
-                
-            except Exception as e2:
-                print(f"❌ Alternative search also failed: {e2}")
-                return []
-    
-    def download_video(self, url: str, quality: str = "lowest_360p") -> bool:
-        """
-        Download a YouTube video with quality settings:
-        - At least 360p
-        - Lowest possible quality above 360p
-        """
-        print(f"⬇️ Downloading video: {url}")
-        print(f"🎯 Quality setting: At least 360p, lowest possible")
-        
-        try:
-            # Create YouTube object
-            yt = YouTube(url)
-            
-            print(f"  📹 Title: {yt.title}")
-            print(f"  ⏱️ Duration: {yt.length} seconds")
-            print(f"  👁️ Views: {yt.views:,}")
-            print(f"  👤 Author: {yt.author}")
-            
-            # Select the best stream based on our quality preferences
-            video_stream, selected_quality = self.select_best_stream(yt)
-            
-            if not video_stream:
-                print("  ❌ No suitable stream found")
-                return False
-            
-            # Handle adaptive streams (need to merge with audio)
-            if hasattr(video_stream, 'includes_audio_track') and not video_stream.includes_audio_track:
-                print("  🔄 Getting audio stream for adaptive video...")
-                audio_stream = yt.streams.filter(only_audio=True).first()
-                
-                if audio_stream:
-                    print(f"  📥 Downloading video: {selected_quality}")
-                    print(f"  📦 Video size: {video_stream.filesize / (1024*1024):.1f} MB")
-                    
-                    # Download video
-                    safe_title = self.sanitize_filename(yt.title)
-                    video_path = video_stream.download(
-                        output_path=str(self.downloads_dir),
-                        filename=f"{safe_title}_video.mp4"
-                    )
-                    
-                    print(f"  📥 Downloading audio...")
-                    audio_path = audio_stream.download(
-                        output_path=str(self.downloads_dir),
-                        filename=f"{safe_title}_audio.mp4"
-                    )
-                    
-                    # Merge video and audio (simplified - just save both files)
-                    print("  ⚠️ Video and audio downloaded separately")
-                    print("  ℹ️ Use ffmpeg to merge: ffmpeg -i video.mp4 -i audio.mp4 -c copy output.mp4")
-                    
-                    # Save info
-                    self._save_video_info(yt, url, video_stream, video_path)
-                    return True
+            except ImportError:
+                # Fallback to pytube search
+                if PYTUBE_AVAILABLE:
+                    search_results = Search(query)
+                    results = []
+                    for video in search_results.results:
+                        if len(results) >= max_results:
+                            break
+                        try:
+                            video_info = {
+                                'title': video.title,
+                                'url': f"https://youtube.com/watch?v={video.video_id}",
+                                'duration': str(video.length) if hasattr(video, 'length') else 'Unknown',
+                                'views': video.views if hasattr(video, 'views') else 'Unknown',
+                                'author': video.author if hasattr(video, 'author') else 'Unknown'
+                            }
+                            results.append(video_info)
+                            print(f"  ✅ {len(results)}. {video_info['title'][:80]}")
+                        except:
+                            continue
                 else:
-                    print("  ❌ No audio stream available")
-                    return False
+                    raise Exception("No search module available")
             
-            # Download progressive stream
-            safe_title = self.sanitize_filename(yt.title)
-            print(f"  📥 Downloading: {selected_quality}")
-            print(f"  📦 Size: {video_stream.filesize / (1024*1024):.1f} MB")
+            # Save results
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_query = self.sanitize_filename(query[:50])
             
-            video_path = video_stream.download(
-                output_path=str(self.downloads_dir),
-                filename=f"{safe_title}.mp4"
-            )
+            # Save as text
+            results_file = self.results_dir / f"search_{safe_query}_{timestamp}.txt"
+            with open(results_file, 'w', encoding='utf-8') as f:
+                f.write(f"YouTube Search Results for: {query}\n")
+                f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("=" * 60 + "\n\n")
+                
+                for i, video in enumerate(results, 1):
+                    f.write(f"{i}. {video['title']}\n")
+                    f.write(f"   URL: {video['url']}\n")
+                    f.write(f"   Channel: {video['author']}\n")
+                    f.write(f"   Duration: {video['duration']}\n")
+                    f.write(f"   Views: {video['views']}\n")
+                    f.write("\n")
             
-            # Save info
-            self._save_video_info(yt, url, video_stream, video_path)
+            # Save as JSON
+            json_file = self.results_dir / f"search_{safe_query}_{timestamp}.json"
+            with open(json_file, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
             
-            print(f"✅ Download complete: {safe_title}.mp4")
-            print(f"📊 Quality: {selected_quality}")
-            return True
+            print(f"📄 Results saved to: {results_file}")
+            return results
             
-        except VideoUnavailable:
-            print(f"❌ Video is unavailable: {url}")
-            return False
-        except PytubeError as e:
-            print(f"❌ Pytube error: {e}")
-            return False
         except Exception as e:
-            print(f"❌ Download failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    def _save_video_info(self, yt: YouTube, url: str, stream, video_path: str):
-        """Save video information to a text file"""
-        safe_title = self.sanitize_filename(yt.title)
-        info_file = self.downloads_dir / f"{safe_title}_info.txt"
-        
-        with open(info_file, 'w', encoding='utf-8') as f:
-            f.write(f"Title: {yt.title}\n")
-            f.write(f"URL: {url}\n")
-            f.write(f"Duration: {yt.length} seconds\n")
-            f.write(f"Views: {yt.views:,}\n")
-            f.write(f"Author: {yt.author}\n")
-            f.write(f"Quality: {stream.resolution}\n")
-            f.write(f"File Size: {os.path.getsize(video_path) / (1024*1024):.1f} MB\n")
-            f.write(f"Download Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Quality Policy: Minimum 360p, lowest possible\n")
+            print(f"❌ Search failed: {e}")
+            return []
     
     def get_channel_videos(self, channel_url: str) -> List[Dict]:
         """Get 10 most recent videos from a channel"""
         print(f"📺 Getting recent videos from channel: {channel_url}")
         
         try:
-            # Create Channel object
-            channel = Channel(channel_url)
-            
-            print(f"  📢 Channel: {channel.channel_name}")
-            
-            videos = []
-            count = 0
-            
-            for video in channel.videos:
-                if count >= 10:
-                    break
+            # Try yt-dlp first for channel extraction
+            if YT_DLP_AVAILABLE:
+                ydl_opts = {
+                    'quiet': True,
+                    'extract_flat': True,
+                    'playlistend': 10,
+                }
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(channel_url, download=False)
                     
-                try:
-                    video_info = {
-                        'title': video.title,
-                        'url': f"https://youtube.com/watch?v={video.video_id}",
-                        'duration': str(video.length) if hasattr(video, 'length') else 'Unknown',
-                        'views': video.views if hasattr(video, 'views') else 'Unknown',
-                        'publish_date': str(video.publish_date) if hasattr(video, 'publish_date') else 'Unknown'
-                    }
-                    videos.append(video_info)
-                    count += 1
-                    print(f"  ✅ {count}. {video_info['title'][:80]}")
-                except Exception as e:
-                    print(f"  ⚠️ Error getting video info: {e}")
-                    continue
+                    channel_name = info.get('title', info.get('uploader', 'Unknown'))
+                    print(f"  📢 Channel: {channel_name}")
+                    
+                    videos = []
+                    entries = info.get('entries', [])
+                    
+                    for entry in entries[:10]:
+                        if entry:
+                            video_info = {
+                                'title': entry.get('title', 'Unknown'),
+                                'url': f"https://youtube.com/watch?v={entry.get('id', '')}",
+                                'duration': str(entry.get('duration', 'Unknown')),
+                                'views': entry.get('view_count', 'Unknown'),
+                                'publish_date': entry.get('upload_date', 'Unknown')
+                            }
+                            videos.append(video_info)
+                            print(f"  ✅ {len(videos)}. {video_info['title'][:80]}")
+            else:
+                # Fallback to pytube
+                if PYTUBE_AVAILABLE:
+                    channel = Channel(channel_url)
+                    channel_name = channel.channel_name
+                    print(f"  📢 Channel: {channel_name}")
+                    
+                    videos = []
+                    for video in channel.videos:
+                        if len(videos) >= 10:
+                            break
+                        try:
+                            video_info = {
+                                'title': video.title,
+                                'url': f"https://youtube.com/watch?v={video.video_id}",
+                                'duration': str(video.length) if hasattr(video, 'length') else 'Unknown',
+                                'views': video.views if hasattr(video, 'views') else 'Unknown',
+                                'publish_date': str(video.publish_date) if hasattr(video, 'publish_date') else 'Unknown'
+                            }
+                            videos.append(video_info)
+                            print(f"  ✅ {len(videos)}. {video_info['title'][:80]}")
+                        except:
+                            continue
+                else:
+                    raise Exception("No channel extraction method available")
             
             # Save results
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            channel_name = self.sanitize_filename(channel.channel_name)
-            results_file = self.results_dir / f"channel_{channel_name}_{timestamp}.txt"
+            safe_name = self.sanitize_filename(channel_name)
             
+            # Save as text
+            results_file = self.results_dir / f"channel_{safe_name}_{timestamp}.txt"
             with open(results_file, 'w', encoding='utf-8') as f:
-                f.write(f"Recent Videos from: {channel.channel_name}\n")
+                f.write(f"Recent Videos from: {channel_name}\n")
                 f.write(f"Channel URL: {channel_url}\n")
                 f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("=" * 60 + "\n\n")
@@ -424,12 +546,11 @@ class YouTubeDownloader:
                     f.write("\n")
             
             # Save as JSON
-            json_file = self.results_dir / f"channel_{channel_name}_{timestamp}.json"
+            json_file = self.results_dir / f"channel_{safe_name}_{timestamp}.json"
             with open(json_file, 'w', encoding='utf-8') as f:
                 json.dump(videos, f, indent=2, ensure_ascii=False)
             
             print(f"📄 Results saved to: {results_file}")
-            print(f"📄 JSON saved to: {json_file}")
             return videos
             
         except Exception as e:
@@ -449,7 +570,6 @@ class YouTubeDownloader:
         processed_commands = []
         
         for command in commands:
-            # Skip comments
             if command.startswith('#'):
                 continue
             
@@ -474,27 +594,27 @@ class YouTubeDownloader:
             # Handle download command
             elif command.startswith('download '):
                 url = command[9:].strip()
-                if url and ('youtube.com' in url or 'youtu.be' in url):
+                if url:
                     self.download_video(url)
                     processed_commands.append(command)
                 else:
-                    print(f"❌ Invalid YouTube URL: {url}")
+                    print("❌ Empty URL")
             
             # Handle channel command
             elif command.startswith('channel '):
                 channel_url = command[8:].strip()
-                if channel_url and 'youtube.com' in channel_url:
+                if channel_url:
                     self.get_channel_videos(channel_url)
                     processed_commands.append(command)
                 else:
-                    print(f"❌ Invalid channel URL: {channel_url}")
+                    print("❌ Empty channel URL")
             
             else:
                 print(f"❌ Unknown command: {command}")
                 print("  Valid commands:")
                 print("    search <query> - Search for videos")
-                print("    download <youtube_url> - Download video (min 360p)")
-                print("    channel <channel_url> - Get recent channel videos")
+                print("    download <youtube_url> - Download video")
+                print("    channel <channel_url> - Get recent videos")
         
         # Clear processed commands
         if processed_commands:
@@ -511,35 +631,30 @@ class YouTubeDownloader:
         print(f"{'='*60}")
         
         # Check downloads
-        downloads = list(self.downloads_dir.glob("*.mp4"))
+        downloads = list(self.downloads_dir.glob("*"))
         if downloads:
-            print(f"\n📁 Downloads ({len(downloads)} files):")
-            for file in downloads:
-                size_mb = os.path.getsize(file) / (1024*1024)
-                # Check resolution from filename or info file
-                info_file = self.downloads_dir / f"{file.stem}_info.txt"
-                quality = "Unknown"
-                if info_file.exists():
-                    with open(info_file, 'r') as f:
-                        for line in f:
-                            if line.startswith("Quality:"):
-                                quality = line.split(":")[1].strip()
-                
-                print(f"  • {file.name} ({size_mb:.1f} MB) - {quality}")
+            video_files = [f for f in downloads if f.suffix in ['.mp4', '.mkv', '.webm']]
+            if video_files:
+                print(f"\n📁 Downloaded Videos ({len(video_files)}):")
+                for file in video_files:
+                    size_mb = os.path.getsize(file) / (1024*1024)
+                    print(f"  • {file.name} ({size_mb:.1f} MB)")
         
         # Check results
         results = list(self.results_dir.glob("*"))
         if results:
-            print(f"\n📄 Results ({len(results)} files):")
-            for file in results:
-                if file.suffix in ['.txt', '.json']:
-                    size_kb = os.path.getsize(file) / 1024
-                    print(f"  • {file.name} ({size_kb:.1f} KB)")
+            txt_files = [f for f in results if f.suffix == '.txt']
+            json_files = [f for f in results if f.suffix == '.json']
+            print(f"\n📄 Results ({len(txt_files)} text, {len(json_files)} JSON):")
+            for file in txt_files[:5]:  # Show last 5
+                print(f"  • {file.name}")
+            if len(txt_files) > 5:
+                print(f"  ... and {len(txt_files) - 5} more")
 
 def main():
-    """Main function"""
     print("🎬 YouTube Downloader - GitHub Actions")
     print("📊 Quality Settings: Minimum 360p, Lowest Possible")
+    print("🔄 Using multiple download methods for reliability")
     print("=" * 60)
     
     downloader = YouTubeDownloader()

@@ -1,0 +1,58 @@
+name: YouTube Downloader
+
+on:
+  push:
+    paths:
+      - 'commands.txt'
+  workflow_dispatch:
+    inputs:
+      command:
+        description: 'Manual command (search/download/channel)'
+        required: false
+        default: ''
+
+jobs:
+  process-commands:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytube pytube-search youtube-search-python
+    
+    - name: Create directories
+      run: |
+        mkdir -p downloads results
+    
+    - name: Process commands
+      run: python downloader.py
+    
+    - name: Commit and push results
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        
+        # Add downloads and results
+        git add downloads/ results/ commands.txt
+        
+        # Check if there are changes to commit
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "🤖 Processed YouTube commands [skip ci]"
+          git push
+        fi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

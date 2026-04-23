@@ -1,0 +1,6 @@
+# YouTube Downloader Commands
+# Commands:
+#   search <query> - Search YouTube
+#   download <url> - Download video
+#   channel <url> - Get 10 recent videos from channel
+# Add your commands below this line:
